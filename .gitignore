@@ -1,0 +1,10 @@
+*.RData
+.Rhistory
+.Rproj.user/
+external_data/
+metric_apl/
+output/
+pmsi_2017/
+R/*.html
+*.osm
+traffic_lights.osm

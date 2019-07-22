@@ -1,0 +1,659 @@
+---
+title: "Comprendre les écarts entre Metric et OSRM, prise en compte des signalisations"
+author: Philéas Condemine
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+    toc_depth: 4
+---
+
+# Les packages
+
+```{r}
+set.seed(100)
+```
+
+```{r}
+suppressMessages({
+  library(magrittr) # pour le %<>% qui n'est pas dans dplyr
+  library(dplyr)
+  library(data.table)
+  library(plotly)
+  library(rpart)
+  library(glmnet)
+  library(caret)
+  library(FNN)
+  library(xgboost)
+  library(doParallel)
+  library(purrr)
+  library(purrrlyr)
+  # https://github.com/christophM/iml
+  # http://uc-r.github.io/iml-pkg
+  library(iml)
+  library(lime)
+})
+
+```
+
+
+# Les données
+
+Le script de téléchargement des données est `download_external_data.R`, n'hésitez pas à y jeter un oeil.
+
+```{r}
+load("../facteurs_explicatifs.RData")
+load("../external_data/OSM/stats_traffic_lights.RData")
+
+stats_traffic_lights=stats_traffic_lights%>%
+  mutate_if(is.factor,as.character)
+
+com_data=filo%>%
+  merge(infos_geo,by.x="CODGEO",by.y="INSEE_COM",all=T)%>%
+  merge(recensement,by.x="CODGEO",by.y="cod_com",all=T)%>%
+  merge(serv_medical,by.x="CODGEO",by.y="CODGEO",all=T)%>%
+  merge(serv_particuliers,by.x="CODGEO",by.y="CODGEO",all=T)%>%
+  merge(stats_altitude,by.x="CODGEO",by.y="com",all=T) %>%
+  merge(stats_mbpro,by.x="CODGEO",by.y="COMMUNE",all=T)%>%
+  merge(stats_mbsco,by.x="CODGEO",by.y="COMMUNE",all=T)%>%
+  merge(stats_migcom,by.x="CODGEO",by.y="COMMUNE",all=T)%>%
+  merge(taxe_fonc,by.x="CODGEO",by.y="cod_com",all=T)%>%
+  merge(taxe_hab,by.x="CODGEO",by.y="cod_com",all=T)%>%
+  merge(stats_ecarts_com,by.x="CODGEO",by.y="commune_patient",all=T)%>%
+  merge(stats_traffic_lights,by="CODGEO",all=T)%>%
+  dplyr::select(-LIBGEO.x,-LIBGEO.y,-REG.y,-DEP.y)%>%
+  mutate(densite_patients=log(flux_patients/SUPERFICIE),
+                  stats_traffic_lights_m2=log(nb_traffic_signals/SUPERFICIE),
+                  nb_mobpro2014=log(nb_mobpro2014))
+
+
+
+rm(infos_geo,recensement,serv_medical,serv_particuliers,stats_altitude,stats_mbpro,stats_mbsco,stats_migcom,taxe_fonc,taxe_hab,stats_ecarts_com,filo,stats_traffic_lights)
+
+# com_data$nb_traffic_signals
+```
+
+
+
+```{r}
+nrow(com_data)
+com_data=com_data%>%
+  filter(!is.na(ecart_temps_moyen))
+nrow(com_data)
+
+```
+
+
+## Arbre de décision pour une première interprétation.
+
+
+
+En général, on réalise un échantillonnage aléatoire. 
+
+
+
+```{r}
+quantile(com_data$X_CENTROID,1:9/10,na.rm=T)
+test=which(com_data$X_CENTROID<quantile(com_data$X_CENTROID,1.5/10,na.rm=T))
+val=which(com_data$X_CENTROID>=quantile(com_data$X_CENTROID,1.5/10,na.rm=T)&com_data$X_CENTROID<quantile(com_data$X_CENTROID,3/10,na.rm=T))
+train=which(com_data$X_CENTROID>=quantile(com_data$X_CENTROID,3/10,na.rm=T))
+val_bad=sample(train,size = round(length(train)*.2))
+train=setdiff(train,val_bad)
+NAs=split(which(is.na(com_data$X_CENTROID)),c(1,2,3,4,4))
+
+data_split=list(c(test,NAs$`1`),
+                c(val,NAs$`2`),
+                c(val_bad,NAs$`3`),
+                c(train,NAs$`4`)
+                )
+lapply(data_split,length)
+```
+
+```{r}
+com_data$sample=""
+com_data[data_split[[1]],]$sample <- "test"
+com_data[data_split[[2]],]$sample <- "val"
+com_data[data_split[[3]],]$sample <- "val_bad"
+com_data[data_split[[4]],]$sample <- "train"
+```
+
+```{r}
+ggplot(com_data,aes(x=X_CHF_LIEU,y=Y_CHF_LIEU,color=sample))+geom_point()
+```
+
+
+
+
+```{r}
+data_rpart=com_data%>%
+dplyr::select(-ecart_dist_moyen,-CODGEO,-LIBGEO,-DEP.x,-REG.x)
+
+data_train=data_rpart%>%filter(sample=="train")%>%select(-sample)
+data_val=data_rpart%>%filter(sample=="val")%>%select(-sample)
+data_val_bad=data_rpart%>%filter(sample=="val_bad")%>%select(-sample)
+data_test=data_rpart%>%filter(sample=="test")%>%select(-sample)
+
+```
+
+
+
+```{r}
+system.time(rpart_train <- 
+              rpart(ecart_temps_moyen~.,
+                    data=data_train, 
+                    control = rpart.control(cp=.01,maxdepth=6)))
+
+rpart.plot::rpart.plot(rpart_train)
+```
+
+On calcule la performance du modèle pour différents niveaux d'élagage (grâce au paramètre de complexité cp). La mesure d'erreur retenue est le Gini normalisé ce qui présente deux avantages : 
+- ce n'est pas la métrique optimisée par le modèle, le risque d'un gridsearch est souvent d'obtenir un modèle "trop" optimisé selon une métrique bien précise qui performe moins bien sur d'autres métriques.
+- cette mesure est comprise en 0 et 1 parce qu'on normalise l'aire sous la courbe de gain (~Lorenz) par l'aire sous la courbe réalisée par le modèle du "devin". 
+
+
+On reviendra sur l'implémentation de cette métrique dans la partie suivante !
+
+
+En comparant la performance sur l'échantillon de validation stratifié géographiquement et sur l'échantillon non-stratifié on mesure l'impact du sur-apprentissage géographique.
+
+
+```{r}
+rpart_grid=expand.grid(cp=c(0,0.01,0.05,0.1,0.2))
+grid_res <- purrr::map_dfr(rpart_grid$cp,function(cp){
+  rpart_train <- rpart(ecart_temps_moyen~.,
+                    data=data_train, 
+                    control = rpart.control(cp=cp,maxdepth=10))
+  gini_val=MLmetrics::NormalizedGini(predict(rpart_train,data_val),data_val$ecart_temps_moyen)
+  gini_val_bad=MLmetrics::NormalizedGini(predict(rpart_train,data_val_bad),data_val_bad$ecart_temps_moyen)
+    
+  data.frame(cp=cp,gini_val=gini_val,gini_val_bad=gini_val_bad)
+})
+grid_res=data.table(grid_res)%>%melt(id.vars="cp")
+setnames(grid_res,"value","gini")
+g <- ggplot(grid_res,aes(x=cp,y=gini,color=variable))+geom_line()
+ggplotly(g)
+
+```
+
+```{r}
+
+rpart_train <- rpart(ecart_temps_moyen~.,
+                    data=data_train, 
+                    control = rpart.control(cp=0,maxdepth=10))
+MLmetrics::NormalizedGini(predict(rpart_train,data_train),data_train$ecart_temps_moyen)
+MLmetrics::NormalizedGini(predict(rpart_train,data_val_bad),data_val_bad$ecart_temps_moyen)
+MLmetrics::NormalizedGini(predict(rpart_train,data_val),data_val$ecart_temps_moyen)
+MLmetrics::NormalizedGini(predict(rpart_train,data_test),data_test$ecart_temps_moyen)
+```
+
+
+
+## GLM pénalisé
+
+Face au nombre important de variables présentes, il est préférable de pénaliser la régression. Les GLM nécessitent un travail préparatoire de traitement des valeurs manquantes. On va réaliser une imputation simple en mettant les NA à 0. Dans certains cas ce n'est peut être pas cohérent...
+
+```{r}
+
+data_glmnet=com_data%>%
+  dplyr::select(-ecart_dist_moyen,
+                -CODGEO,-LIBGEO,-DEP.x,-REG.x)%>% 
+  mutate_all(function(x){
+    x[is.na(x)]<-0
+    x
+  })%>%
+  mutate_if(is.character,factor)
+
+
+
+data_train=data_glmnet%>%filter(sample=="train")%>%select(-sample)
+data_val=data_glmnet%>%filter(sample=="val")%>%select(-sample)
+data_val_bad=data_glmnet%>%filter(sample=="val_bad")%>%select(-sample)
+data_test=data_glmnet%>%filter(sample=="test")%>%select(-sample)
+
+
+x_train=data_train%>%select(-ecart_temps_moyen)%>%as.matrix
+y_train=data_train$ecart_temps_moyen
+
+x_val=data_val%>%select(-ecart_temps_moyen)%>%as.matrix
+y_val=data_val$ecart_temps_moyen
+
+x_val_bad=data_val_bad%>%select(-ecart_temps_moyen)%>%as.matrix
+y_val_bad=data_val_bad$ecart_temps_moyen
+
+x_test=data_test%>%select(-ecart_temps_moyen)%>%as.matrix
+y_test=data_test$ecart_temps_moyen
+```
+
+
+Avec un paramétrage minimal, 100 modèles seront entraînés pour différentes valeurs de lambda ie plusieurs niveaux de pénalisation. Par défaut alpha=1 donc pénalisation L1.
+
+Les coefficients du modèle sont donc contenus dans une matrice 100 x nombre de variables (les facteurs étant binarisés).
+```{r}
+glmnet_grid=glmnet::glmnet(y=y_train,
+               x=x_train,
+               family="gaussian")
+
+
+glmnet_coefs=coef(glmnet_grid,s = glmnet_grid$lambda)%>%
+  as.matrix%>%t%>%as.data.frame%>%as.tbl
+glmnet_coefs$lambda=glmnet_grid$lambda
+setorder(glmnet_coefs,lambda)
+glmnet_coefs
+```
+
+
+On compare les performances des 100 modèles sur l'échantillon stratifié de validation et sur l'échantillon non stratifié. Sur l'échantillon non-stratifié, le sur-apprentissage est encouragé donc le meilleur modèle est obtenu pour une absence de pénalisation. Sur l'autre échantillon on tire avantage de la pénalisation.
+
+```{r}
+pred_glmnets_val=predict(object = glmnet_grid,newx=x_val,s=glmnet_grid$lambda)
+
+pred_glmnets_val_bad=predict(object = glmnet_grid,newx=x_val_bad,s=glmnet_grid$lambda)
+
+
+norm_gini_coefs=data.table(
+  gini_val=pbapply::pbsapply(data.frame(pred_glmnets_val),
+                             MLmetrics::NormalizedGini,
+                             y_true = y_val),
+  gini_val_bad=pbapply::pbsapply(data.frame(pred_glmnets_val_bad),
+                                 MLmetrics::NormalizedGini,
+                                 y_true = y_val_bad), 
+  lambda=glmnet_grid$lambda)
+
+# on restructure la donnée pour faire un graph avec ggplot2
+norm_gini_coefs=melt(norm_gini_coefs,id.vars="lambda")
+setnames(norm_gini_coefs,"value","gini")
+```
+
+```{r}
+g <- ggplot(data=norm_gini_coefs,aes(x=lambda,y=gini,color=variable))+geom_point()
+ggplotly(g)
+```
+
+
+### Digression coefficient de Gini Normalisé (aire sous la courbe de de gain ou de Lorenz)
+
+L'idée est d'utiliser la prédiction pour trier les observations et de mesurer la capacité du modèle à séparer les faibles écarts des grands écarts. Si on parlait de distribution de richesse et que notre modèle était une économie empirique, on retomberait sur la courbe de Lorenz. En assurance on utilise cette métrique pour mesurer la capacité du modèle à séparer les hauts risques des faibles risques et donc à ségmenter les risques.
+
+Pour vérifier votre compréhension, si vous le souhaitez, vous pouvez essayer de coder cette métrique.
+
+Avez-vous bien compris à quoi sert la normalisation ?
+
+```{r}
+my_norm_gini=function(pred,obs){
+  mydata=data.table(pred=pred,obs=obs)
+  setorder(mydata,-pred)
+  mydata[,cum_val:=cumsum(obs)/sum(obs)]
+  area_pred=sum(mydata$cum_val)/nrow(mydata)
+  area_pred=area_pred*2-1
+  
+  mydata=data.table(pred=pred,obs=obs)
+  setorder(mydata,-obs)
+  mydata[,cum_val:=cumsum(obs)/sum(obs)]
+  area_perf=sum(mydata$cum_val)/nrow(mydata)
+  area_perf=area_perf*2-1
+  norm_gini=area_pred/area_perf
+  norm_gini
+}
+
+norm_gini_coefs2=pbapply::pblapply(data.frame(pred_glmnets_val),my_norm_gini,obs = y_val)
+```
+
+Les implémentations ne sont pas tout à fait identiques, écart de 1/1000.
+
+
+```{r}
+ecart_implementations_gini=(unlist(norm_gini_coefs%>%filter(variable=="gini_val")%>%select(gini))-unlist(norm_gini_coefs2))/unlist(norm_gini_coefs2)
+plot(ecart_implementations_gini)
+
+data.frame(gini_from_package=unlist(norm_gini_coefs%>%filter(variable=="gini_val")%>%select(gini)),my_gini=unlist(norm_gini_coefs2))%>%{
+  ggplot(data=.,aes(x=my_gini,y=gini_from_package))+geom_point()+geom_abline(slope = 1,intercept = 0)
+  }%>%ggplotly
+abline(1,0)
+```
+
+### Choix du meilleur GLM pénalisé
+
+En plus de faire varier le lambda (qui pondère le terme de pénalisation dans la fonction de perte), on va tester plusieurs alpha (coefficient d'arbitrage entre pénalisations L1 et L2).
+
+Il est intéressant de comprendre comme lambda est calculé. On sait qu'à partir d'un certain lambda tous les coefficients du modèle sont nuls. Ceci définit un lambda.max et le modèle le plus parcimonieux. Ensuite des lambdas inférieurs sont testés (100 par défaut) pour retenir des modèles plus complexes. Naturellement le lambda minimal est celui qui est équivalent à une absence de pénalisation (coefficients proches de ceux pour lambda=0).
+
+
+```{r}
+get_glmnet_pref=function(alpha){
+  
+  glmnet_grid=glmnet::glmnet(y=y_train,
+                             x=x_train,alpha=alpha,
+                             family="gaussian")
+  lambdas=glmnet_grid$lambda
+  pred_glmnets=data.frame(predict(object = glmnet_grid,newx=x_val,s=lambdas))#tester avec x_val_bad,x_test et x_train. Les résultats changent complètement, ceci permet de comprendre l'importance de la validation sur un échantillon pertinent
+  
+  norm_gini_coefs=sapply(pred_glmnets,MLmetrics::NormalizedGini,y_true = y_val )#y_val_bad ou y_train ou y_test
+  perfs_glmnet=data.frame(gini=norm_gini_coefs,lambda=lambdas,alpha=alpha)
+  perfs_glmnet
+}
+
+preds=purrr::map_dfr(0:10/10,get_glmnet_pref)
+```
+
+Quel est le meilleur couple alpha-lambda ? Il est important de vérifier la stabilité de la performance autour du couple alpha-lambda optimal, on ne veut pas over-fitter le couple de paramètres.
+
+```{r}
+g <- ggplot(data=preds,aes(x=lambda,y=gini,color=factor(alpha)))+geom_point()
+g %>% ggplotly
+```
+
+On transforme le lambda en log(lambda) pour rendre le graph plus lisible. On normalise également les indices de Gini pour faciliter la comparaison des paramètres. 
+
+```{r}
+
+preds$gini_scaled=(preds$gini-min(preds$gini))/(max(preds$gini)-min(preds$gini))
+g <- ggplot(data=preds,aes(x=log(lambda),y=gini_scaled,color=alpha))+geom_point()+theme(axis.text.y = element_blank())+scale_color_gradient2(low="blue",midpoint = .5 ,mid="yellow",high="red")
+
+g %>% ggplotly
+```
+
+Une autre façon de le vérifier visuellement. Cette visualisation est moins efficace, on se rend compte que tous les alpha permettent d'obtenir à peu prêt le même niveau de performance mais on distingue moins bien une valeur optimale qu'avec les deux graphes précédents.
+
+```{r}
+setorder(preds,gini)
+preds$gini_rank=1:nrow(preds)/nrow(preds)
+g <- ggplot(data=preds,aes(x=alpha,y=log(lambda),size=gini_rank,color=gini_rank))+geom_point()+theme(axis.text.y = element_blank())+scale_color_gradient2(low="blue",mid="green",high="red",midpoint=.5)
+
+g %>% ggplotly
+```
+
+On peut vérifier nos impressions visuelles avec un vote par plus proches voisins. 
+
+```{r}
+gini_NN=preds$gini[FNN::get.knn(preds[,c("alpha","lambda")])$nn.index]
+gini_NN=gini_NN%>%matrix(ncol=10)
+preds$gini_10neighbors=rowSums(gini_NN)/10
+preds=data.table(preds)
+setorder(preds,-gini_10neighbors)
+preds[,lambda_rank:=order(lambda),by="alpha"]
+preds[,c("gini","gini_10neighbors","alpha","lambda_rank")]
+
+```
+
+
+Les GLM, sans croisement entre les variables, semblent bloquer à 42,5% de Gini normalisé pour l'échantillon randomisé avec stratification géographique et 44% pour l'échantillon randomisé non-stratifié (45% avec l'échantillon d'apprentissage), ce qui abonde dans le sens d'un overfitting sur les variables géographiques. 
+
+On ré-entraîne le modèle avec cet alpha optimal
+
+```{r}
+glmnet_grid=glmnet::glmnet(y=y_train,
+               x=x_train,alpha=.9,
+               family="gaussian")
+
+
+glmnet_coefs=coef(glmnet_grid,s = glmnet_grid$lambda)%>%
+  as.matrix%>%t%>%as.data.frame%>%as.tbl
+glmnet_coefs$lambda=glmnet_grid$lambda
+
+pred_glmnets_val=predict(object = glmnet_grid,newx=x_val,s=glmnet_grid$lambda)
+
+pred_glmnets_val_bad=predict(object = glmnet_grid,newx=x_val_bad,s=glmnet_grid$lambda)
+
+pred_glmnets_test=predict(object = glmnet_grid,newx=x_test,s=glmnet_grid$lambda)
+
+norm_gini_coefs=data.table(
+  gini_val=pbapply::pbsapply(data.frame(pred_glmnets_val),
+                             MLmetrics::NormalizedGini,
+                             y_true = y_val),
+  gini_val_bad=pbapply::pbsapply(data.frame(pred_glmnets_val_bad),
+                                 MLmetrics::NormalizedGini,
+                                 y_true = y_val_bad), 
+  gini_test=pbapply::pbsapply(data.frame(pred_glmnets_test),
+                                 MLmetrics::NormalizedGini,
+                                 y_true = y_test),
+  lambda=glmnet_grid$lambda)
+
+glmnet_coefs=merge(norm_gini_coefs,glmnet_coefs,by="lambda")
+```
+
+
+Et si on essayait de comprendre ce qui se passe lorsque la pénalisation améliore le modèle ? On image que certaines variables vont voir leur coefficient passer à 0.
+
+### Interprétation du rôle de la pénalisation 
+
+
+
+
+```{r}
+glmnet_coefs=data.table(glmnet_coefs)
+setorder(glmnet_coefs,lambda)
+glmnet_coefs$lambda_ordre=1:nrow(glmnet_coefs)
+g <- ggplot(glmnet_coefs%>%filter(gini_val>.2),aes(x=lambda,y=MED15,color=gini_val,size=exp(gini_val)))+geom_point()+ggtitle("Evolution du coefficient de la variable MED15 lorsque lambda augmente")+scale_color_gradient2(low="blue",mid="green",high="red",midpoint=.39)
+ggplotly(g)
+```
+
+La corrélation entre les coefficients estimés pour les variables et le coefficient de Gini devrait nous permettre d'identifier les variables dont les coefficients sont modifiés avec un effet sur la mesure d'erreur.
+
+```{r}
+cors_gini=cor(x = glmnet_coefs$gini_val,y = glmnet_coefs)%>%abs
+cors_gini=data.frame(vars=colnames(cors_gini),cor=cors_gini[1,],stringsAsFactors = F)
+cors_gini=cors_gini%>%arrange(-cor)
+cors_gini
+```
+
+
+Si on étude les corrélations en différence plutôt qu'en niveau, que peut-on apprendre ?
+```{r}
+glmnet_coefs_dif=sapply(glmnet_coefs,diff)%>%data.table
+
+cors_gini=cor(x = glmnet_coefs_dif$gini_val,y = glmnet_coefs_dif)%>%abs
+cors_gini=data.frame(vars=colnames(cors_gini),cor=cors_gini[1,],stringsAsFactors = F)
+cors_gini=cors_gini%>%arrange(-cor)
+cors_gini
+
+```
+
+On isole la variable dont le coefficient varie le plus lorsqu'on incrémente lambda (réduction du coefficient voire passage à 0 parce que c'est en général ce que fait L1).
+
+**Disclaimer** : ces résultats peuvent varier d'une fois sur l'autre, il faudrait extraire la liste exhaustive des variables dont les coefficients ont été significativement modifiés pour observer davantage de stabilité.
+
+
+Les variables qui sautent sont les variables géographiques sur lesquelles le modèle sur-apprend : X_CHF_LIEU une géocoordonnée !
+Les variables de taxe foncière et taxe d'habitation sautent aussi, c'est plus surprenant.
+
+```{r}
+glmnet_coefs_dif=sapply(glmnet_coefs,function(x)diff(x)/max(abs(x)))%>%data.table
+names(glmnet_coefs_dif) <- paste0("diff_",names(glmnet_coefs_dif))
+glmnet_coefs_dif=cbind(glmnet_coefs[-1,c("lambda","gini_val","gini_test")],glmnet_coefs_dif)
+vars=colnames(x_train)
+vars_biggest_modif=apply(glmnet_coefs_dif[,paste0("diff_",vars),with=F],1,function(x){
+  x[is.na(x)]<-0
+  x[is.infinite(x)]<-0
+  which.max(abs(x))
+})
+glmnet_coefs_dif$biggest_modif_var=vars[vars_biggest_modif]
+glmnet_coefs_dif$lambda_ordre=1:nrow(glmnet_coefs_dif)
+
+g <- ggplot(glmnet_coefs_dif%>%filter(gini_val>.2),aes(x=lambda_ordre,y=gini_val,color=biggest_modif_var))+geom_point()
+
+ggplotly(g)
+```
+
+
+<div style="border: 2px solid red ;padding:10px;border-radius: 10px;">
+L'overfitting sur X_CHF_LIEU, Y_CHF_LIEU, X_CENTROID, Y_CENTROID est intuitif mais celui sur taxe_fonc2017 l'est un peu moins.
+Une carte ne sera pas d'une grande aide...
+```{r}
+ggplot(com_data,aes(x=X_CHF_LIEU,y=Y_CHF_LIEU,color=taxe_fonc2017))+geom_point()
+```
+
+La présence de corrélation spatiale sur ces variables peut expliquer (partiellement) le potentiel de sur-apprentissage spatial sur ces variables.
+
+```{r}
+geo_data=com_data[,c("X_CHF_LIEU","Y_CHF_LIEU","taxe_fonc2017","taxe_hab2017")]
+geo_data=na.omit(geo_data)
+NN=FNN::get.knn(geo_data,k=1)$nn.index%>%as.vector
+geo_data$taxe_foncNN=geo_data$taxe_fonc2017[NN]
+geo_data$taxe_habNN=geo_data$taxe_hab2017[NN]
+
+cor(geo_data$taxe_fonc2017,geo_data$taxe_foncNN)
+cor(geo_data$taxe_hab2017,geo_data$taxe_habNN)
+
+```
+
+</div>
+
+On veut savoir si les coefficients passent à 0 où s'ils sont seulement atténués.
+
+Pour ce faire, on récupère les coefficients adjacents et on normalise par le max pour faciliter la lecture.
+
+```{r}
+glmnet_coefs_dif$from_to=c("_",sapply(2:(nrow(glmnet_coefs_dif)-1),function(i){
+  voi=glmnet_coefs_dif$biggest_modif_var[i]
+  vals=glmnet_coefs[[voi]][(i-1):(i+1)]
+  vals=vals/max(abs(vals))
+  paste(vals,collapse=" -> ")
+}),"_")
+
+g <- ggplot(glmnet_coefs_dif%>%filter(gini_val>.2),aes(x=lambda_ordre,y=gini_val,label=from_to,color=biggest_modif_var))+theme(legend.position ="none")+geom_point()
+
+ggplotly(g)
+```
+
+En plus de sur-apprendre sur les variables, on peut sur-apprendre sur les hyper-paramètres, on va donc évaluer le "meilleur modèle" sur un jeu de données tiers.
+x_val est adjacent à x_train, alors que x_test est plus loin à l'ouest. De plus x_test est une région littorale (atlantique) alors que x_val n'a presque pas de littoral et x_train a principalement un littoral méditerranéen. Ceci peut justifier l'écart important de performance du modèle entraîné sur x_val et sur x_test.
+
+```{r}
+best_draw=which.max(glmnet_coefs_dif$gini_val)
+best_lambda=glmnet_coefs_dif$lambda[best_draw]
+pred_glmnets_test=predict(object = glmnet_grid,newx=x_test,s=best_lambda)
+pred_glmnets_val_bad=predict(object = glmnet_grid,newx=x_val_bad,s=best_lambda)
+pred_glmnets_val=predict(object = glmnet_grid,newx=x_val,s=best_lambda)
+pred_glmnets_train=predict(object = glmnet_grid,newx=x_train,s=best_lambda)
+
+print("meilleur lambda sur validation, gini sur test");MLmetrics::NormalizedGini(pred_glmnets_test,y_test)
+print("meilleur lambda sur validation, gini sur val");MLmetrics::NormalizedGini(pred_glmnets_val,y_val)
+print("meilleur lambda sur validation, gini sur val non strat");MLmetrics::NormalizedGini(pred_glmnets_val_bad,y_val_bad)
+print("meilleur lambda sur validation, gini sur apprentissage");MLmetrics::NormalizedGini(pred_glmnets_train,y_train)
+
+
+best_draw=1#which.max(glmnet_coefs_dif$gini_test)
+best_lambda=glmnet_coefs_dif$lambda[best_draw]
+pred_glmnets_test=predict(object = glmnet_grid,newx=x_test,s=best_lambda)
+pred_glmnets_val_bad=predict(object = glmnet_grid,newx=x_val_bad,s=best_lambda)
+pred_glmnets_val=predict(object = glmnet_grid,newx=x_val,s=best_lambda)
+pred_glmnets_train=predict(object = glmnet_grid,newx=x_train,s=best_lambda)
+
+print("pas de pénalisation, gini sur test");MLmetrics::NormalizedGini(pred_glmnets_test,y_test)
+print("pas de pénalisation, gini sur val");MLmetrics::NormalizedGini(pred_glmnets_val,y_val)
+print("pas de pénalisation, gini sur val non strat");MLmetrics::NormalizedGini(pred_glmnets_val_bad,y_val_bad)
+print("pas de pénalisation, gini sur apprentissage");MLmetrics::NormalizedGini(pred_glmnets_train,y_train)
+```
+
+
+
+Peut-on faire mieux avec un GBM ?
+
+Intuitivement le GBM devrait mieux performer qu'un GLM pénalisé pour deux raisons :
+
+- Ajustement non-linéaire aux variables continues
+- Interaction entre les variables (**peut-on avoir une approche GBM -> GLM d'extraction des interactions choisies par le GBM pour relancer le GLM avec interactions bien choisies ? On le verra dans la partie IML **)
+
+
+## GBM
+
+
+On va utiliser xgboost qui présente l'intérêt de randomisation sur les variables (comme pour les random forests)
+
+
+Contrairement au GLMnet, les NAs dans les variables explicatives peuvent être traités comme pour rpart, on définit donc un nouveau jeu de données sans traitement des NAs en 0.
+
+On va également créer une nouvelle variable : 
+- densite_patients : même pour un gbm, le ratio de deux variables est une quantité difficile à fitter. => Exercice, essayez par vous même `y/x ~ y + x`.
+- transformation log de la variable nb_mobpro2014. 
+
+**Rappel** : une transformation monotone d'une variable explicative n'aura aucun effet sur la capacité d'apprentissage d'un modèle basé sur des arbres de décision. 
+En revanche dans un modèle GLM, cette transformation peut s'avérer très pertinente.
+
+```{r}
+
+data_xgb=com_data%>%
+    dplyr::select(-ecart_dist_moyen,
+                -CODGEO,-LIBGEO,-DEP.x,-REG.x)%>% 
+
+  # mutate_all(function(x){
+  #   x[is.na(x)]<-0
+  #   x
+  # })%>%
+  mutate_if(is.character,factor)
+
+data_train=data_xgb%>%filter(sample=="train")%>%select(-sample)
+data_val=data_xgb%>%filter(sample=="val")%>%select(-sample)
+data_test=data_xgb%>%filter(sample=="test")%>%select(-sample)
+data_val_bad=data_xgb%>%filter(sample=="val_bad")%>%select(-sample)
+
+x_train=data_train%>%select(-ecart_temps_moyen)%>%as.matrix
+y_train=data_train$ecart_temps_moyen
+
+x_val=data_val%>%select(-ecart_temps_moyen)%>%as.matrix
+y_val=data_val$ecart_temps_moyen
+
+x_test=data_test%>%select(-ecart_temps_moyen)%>%as.matrix
+y_test=data_test$ecart_temps_moyen
+
+x_val_bad=data_val_bad%>%select(-ecart_temps_moyen)%>%as.matrix
+y_val_bad=data_val_bad$ecart_temps_moyen
+```
+
+
+```{r}
+grid=expand.grid(depth=c(1,2,4,6,8),min_weight=c(1,10,100,200),colsample=c(0.3,0.7,1))
+
+cl <- makePSOCKcluster(3)
+registerDoParallel(cl)
+getDoParWorkers()
+
+# https://github.com/dmlc/xgboost/issues/2812 => il faut définir dtrain dans l'itération, une histoire de pointeurs...
+system.time(perf_xgboost_grid <- foreach(i=1:nrow(grid),.combine = rbind,.packages = c("xgboost","magrittr")) %dopar%{
+  dtrain <- xgb.DMatrix(x_train, label=y_train)
+  dval <- xgb.DMatrix(x_val, label=y_val)
+  params=grid[i,]
+  gbm_model=xgb.train(data=dtrain,watchlist = list(train=dtrain,validation=dval),print_every_n =5L,nrounds=500,early_stopping_rounds=50,
+                      params=list(eta=.1, max_depth=params$depth, subsample = .5, min_child_weight = params$min_weight, colsample_bytree =params$colsample,nthread=1, eval_metric=c("rmse")))
+  gbm_pred=predict(gbm_model,x_test)
+  c(params,gini=MLmetrics::NormalizedGini(gbm_pred,y_test),rmse=MLmetrics::RMSE(gbm_pred,y_test))%>%data.frame(stringsAsFactors = F)
+})
+stopCluster(cl)
+save(perf_xgboost_grid,file="../output/xgb_test_w_traffic_signals.RData")
+
+g <- ggplot(perf_xgboost_grid,aes(x=rmse,y=gini,size=depth,alpha=colsample,color=min_weight))+geom_point()
+ggplotly(g)
+load("../output/perf_xgboost_grid_NAtozero.RData")
+g <- ggplot(perf_xgboost_grid,aes(x=rmse,y=gini,size=depth,alpha=colsample,color=min_weight))+geom_point()
+ggplotly(g)
+```
+
+
+
+
+
+
+
+```{r}
+dtrain <- xgb.DMatrix(x_train, label=y_train)
+  dval_bad <- xgb.DMatrix(x_val_bad, label=y_val_bad)
+  dval <- xgb.DMatrix(x_val, label=y_val)
+
+  params=list(eta=.05, max_depth=4, subsample = .5, min_child_weight = 100, colsample_bytree =.5,nthread=3, eval_metric=c("rmse"))
+  
+  gbm_model=xgboost::xgb.train(data=dtrain,watchlist = list(train=dtrain,validation=dval),print_every_n =10L,nrounds=500,early_stopping_rounds=100,params=params)
+  MLmetrics::NormalizedGini(predict(gbm_model,x_train),y_train)
+  MLmetrics::NormalizedGini(predict(gbm_model,x_val_bad),y_val_bad)
+  MLmetrics::NormalizedGini(predict(gbm_model,x_val),y_val)
+  MLmetrics::NormalizedGini(predict(gbm_model,x_test),y_test)
+ 
+```
+
+```{r}
+imp=xgb.importance(model = gbm_model)
+imp
+```
+
+les infos sur les feux de circulation ne servent à rien !
